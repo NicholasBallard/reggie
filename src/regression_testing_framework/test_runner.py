@@ -146,13 +146,21 @@ def create_exception_log(run_dir, test_name, start_time, exception):
 def process_test_result(result, success):
     """
     Process test result to extract error traces and failure information.
+    
+    A test is only considered failed if the return code is non-zero.
+    Warnings that appear in stderr but don't cause a non-zero exit code
+    will be logged but won't cause the test to be marked as failed.
     """
     if success:
+        # If the command exited with code 0, it's a success even if stderr has content
         return None, None
     
+    # If we get here, the command had a non-zero exit code (actual failure)
     stdout, stderr, returncode = result.stdout, result.stderr, result.returncode
     
     error_message = f"Command failed with return code {returncode}"
+    
+    # Extract the most relevant error info from stderr if available
     error_trace = stderr.split("\n")[-3:] if stderr else None
     
     if not error_trace:
@@ -216,7 +224,7 @@ def run_single_test(config_path, test_name, run_dir):
             error_trace = [f"Command timed out after {timeout} seconds"]
             failure = f"Timeout after {timeout} seconds"
         else:
-            # Determine success/failure normally
+            # Determine success/failure based on return code only
             success = result.returncode == 0
             error_trace, failure = process_test_result(result, success)
         
