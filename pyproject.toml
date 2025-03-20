@@ -1,17 +1,17 @@
 [project]
 name = "regression-testing-framework"
-version = "0.1.0"
+version = "0.1.6"
 description = "Run parallel test configurations with log discovery and summary."
 readme = "README.md"
 authors = [
     { name = "Nicholas Ballard", email = "nicholaesricballard@gmail.com" }
 ]
-requires-python = ">=3.13"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
 dependencies = [
-    "celery>=5.4.0",
+    "click>=8.1.0",
     "flask>=3.1.0",
     "pyyaml>=6.0.2",
-    "redis>=5.2.1",
     "sqlite-utils>=3.38",
 ]
 

@@ -32,33 +32,61 @@ def create_run_directory():
 
 def build_command(base_command, params):
     """
-    Build a command by splitting the base command and parameters.
-    """
-    # Start with splitting the base command
-    cmd_parts = base_command.split()
+    Build a command list for subprocess execution.
     
-    # Add each parameter after splitting it
-    for param in params:
-        cmd_parts.extend(param.split())
+    Args:
+        base_command: The base command string
+        params: List of parameters
+        
+    Returns:
+        List of command parts suitable for subprocess.run
+    """
+    if not base_command:
+        raise ValueError("Base command cannot be empty")
     
-    # Join back to a string for shell execution
-    return " ".join(cmd_parts)
+    cmd_parts = [base_command]
+    
+    # Add parameters if they exist
+    if params:
+        cmd_parts.extend(params)
+        
+    return cmd_parts
 
 
-def execute_command(cmd_to_run, env):
+def execute_command(cmd_parts, env, timeout=None):
     """
-    Execute a command with shell=True and return the result.
+    Execute a command and return the result.
+    
+    Args:
+        cmd_parts: List of command parts
+        env: Environment dictionary
+        timeout: Maximum time in seconds to wait for the command to complete
+                (None means wait indefinitely)
+        
+    Returns:
+        CompletedProcess object with stdout, stderr, and returncode
     """
-    return subprocess.run(
-        cmd_to_run,
-        shell=True,
-        capture_output=True,
-        text=True,
-        env=env
-    )
+    try:
+        result = subprocess.run(
+            cmd_parts, 
+            capture_output=True, 
+            text=True, 
+            env=env,
+            shell=False,  # Never use shell=True to avoid shell-related issues
+            timeout=timeout  # Allow timeout for long-running processes
+        )
+        return result
+    except subprocess.TimeoutExpired as e:
+        # Create a CompletedProcess-like object for timeout errors
+        return subprocess.CompletedProcess(
+            args=cmd_parts,
+            returncode=124,  # Use standard timeout exit code
+            stdout=f"Command timed out after {timeout} seconds",
+            stderr=str(e)
+        )
 
 
-def create_log_file(run_dir, test_name, start_time, cmd_to_run, env_vars, result):
+def create_log_file(run_dir, test_name, start_time, cmd_parts, env_vars, result):
     """
     Create a log file with test execution details.
     """
@@ -74,8 +102,9 @@ def create_log_file(run_dir, test_name, start_time, cmd_to_run, env_vars, result
         log.write(f"Test: {test_name}\n")
         log.write(f"Status: {'SUCCESS' if success else 'FAILURE'}\n")
         
-        # Write the command exactly as it will be executed
-        log.write(f"Command: {cmd_to_run}\n")
+        # Write the actual command that was run
+        cmd_str = ' '.join(cmd_parts)
+        log.write(f"Command: {cmd_str}\n")
         
         # Include environment variables in the log
         if env_vars:
@@ -157,26 +186,42 @@ def run_single_test(config_path, test_name, run_dir):
     try:
         # Get base command and parameters
         base_command = get_base_command(config, test_config)
-        params = process_params(test_config, False)
+        if not base_command:
+            raise ValueError(f"No base command specified for test: {test_name}")
+        
+        params = process_params(test_config)
         
         # Setup environment variables
         env = os.environ.copy()
         env_vars = process_environment(test_config)
         env.update(env_vars)
         
-        # Simplified command building
-        cmd_to_run = build_command(base_command, params)
+        # Get timeout from test config or use default
+        # A default of None means wait indefinitely
+        timeout = test_config.get('timeout', None)
+        if timeout is not None:
+            try:
+                timeout = int(timeout)
+            except (ValueError, TypeError):
+                # If timeout is not a valid integer, use None (wait indefinitely)
+                timeout = None
         
-        result = execute_command(cmd_to_run, env)
+        # Build and execute command
+        cmd_parts = build_command(base_command, params)
+        result = execute_command(cmd_parts, env, timeout=timeout)
         
-        # Determine success/failure
-        success = result.returncode == 0
+        # Special handling for timeout result
+        if result.returncode == 124 and "timed out" in result.stdout:
+            success = False
+            error_trace = [f"Command timed out after {timeout} seconds"]
+            failure = f"Timeout after {timeout} seconds"
+        else:
+            # Determine success/failure normally
+            success = result.returncode == 0
+            error_trace, failure = process_test_result(result, success)
         
         # Create log file
-        log_file = create_log_file(run_dir, test_name, start_time, cmd_to_run, env_vars, result)
-        
-        # Process results
-        error_trace, failure = process_test_result(result, success)
+        log_file = create_log_file(run_dir, test_name, start_time, cmd_parts, env_vars, result)
         
     except Exception as e:
         success = False
@@ -186,7 +231,9 @@ def run_single_test(config_path, test_name, run_dir):
     
     # Record end time and log the run
     end_time = datetime.utcnow()
-    log_run(test_name, test_name, cmd_to_run, success, start_time, end_time, log_file, error_trace, failure)
+    
+    cmd_str = ' '.join(cmd_parts) if 'cmd_parts' in locals() else "Command generation failed"
+    log_run(test_name, test_name, cmd_str, success, start_time, end_time, log_file, error_trace, failure)
     
     # Return result information
     result_info = {
@@ -198,14 +245,28 @@ def run_single_test(config_path, test_name, run_dir):
     
     return result_info
 
+
 def run_tests(config_path, run_dir, max_workers=4):
     """
     Run multiple tests in parallel using ThreadPoolExecutor.
+    
+    Ensures all tests complete before returning, with improved error handling 
+    and progress tracking for long-running tests.
     """
     config = load_config(config_path)
     test_names = get_test_names(config)
-    results = []
     
+    if not test_names:
+        print("No tests found in the configuration file.")
+        return []
+    
+    results = []
+    pending_count = len(test_names)
+    completed_count = 0
+    
+    print(f"Starting {pending_count} tests with {max_workers} parallel workers")
+    
+    # Use ThreadPoolExecutor to run tests in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all test jobs to the thread pool
         future_to_test = {
@@ -213,23 +274,81 @@ def run_tests(config_path, run_dir, max_workers=4):
             for test_name in test_names
         }
         
-        # Process results as they complete
-        for future in concurrent.futures.as_completed(future_to_test):
-            test_name = future_to_test[future]
-            try:
-                result = future.result()
-                results.append(result)
-                status = "Succeeded" if result["success"] else "Failed"
-                print(f"Test '{test_name}' {status}")
-            except Exception as e:
-                print(f"Error running test '{test_name}': {e}")
+        # Track which tests are still running
+        running_tests = set(test_names)
+        
+        try:
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_test):
+                test_name = future_to_test[future]
+                running_tests.remove(test_name)
+                completed_count += 1
+                
+                try:
+                    result = future.result()
+                    results.append(result)
+                    status = "Succeeded" if result["success"] else "Failed"
+                    print(f"Test '{test_name}' {status} [{completed_count}/{pending_count} completed]")
+                    
+                    # Print remaining tests every 5 completions or when only a few remain
+                    if running_tests and (completed_count % 5 == 0 or len(running_tests) <= 3):
+                        print(f"Still running: {', '.join(running_tests)}")
+                        
+                except Exception as e:
+                    print(f"Error running test '{test_name}': {e}")
+                    results.append({
+                        "config": test_name,
+                        "success": False,
+                        "error_trace": [str(e)],
+                        "log_file": None
+                    })
+        except KeyboardInterrupt:
+            print("\nReceived keyboard interrupt. Cancelling pending tests...")
+            
+            # Attempt to cancel any pending futures
+            for future in future_to_test:
+                future.cancel()
+            
+            # Wait with a timeout to allow for cleanup
+            # This is a best-effort attempt to avoid process orphaning
+            executor.shutdown(wait=True, cancel_futures=True)
+            
+            # Include the interrupted tests in results
+            for test_name in running_tests:
                 results.append({
                     "config": test_name,
                     "success": False,
-                    "error_trace": [str(e)],
+                    "error_trace": ["Test was interrupted"],
                     "log_file": None
                 })
+            
+            print(f"Interrupted with {len(running_tests)} tests still running")
+            
+        except Exception as e:
+            print(f"Unexpected error in test execution: {e}")
+            # Ensure we don't lose track of running tests in case of errors
+            for test_name in running_tests:
+                if not any(r["config"] == test_name for r in results):
+                    results.append({
+                        "config": test_name,
+                        "success": False,
+                        "error_trace": [f"Test execution error: {str(e)}"],
+                        "log_file": None
+                    })
     
+    # Final verification that we have a result for every test
+    result_test_names = {r["config"] for r in results}
+    for test_name in test_names:
+        if test_name not in result_test_names:
+            print(f"Warning: No result recorded for test '{test_name}', marking as failed")
+            results.append({
+                "config": test_name,
+                "success": False,
+                "error_trace": ["Test result was not properly recorded"],
+                "log_file": None
+            })
+    
+    print(f"All {len(test_names)} tests completed execution")
     return results
 
 
@@ -357,4 +476,3 @@ def run_test_from_cli(config_path, output_path=None, max_workers=4):
     create_latest_symlink(run_dir)
     
     return results, run_dir
-
