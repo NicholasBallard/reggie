@@ -67,20 +67,78 @@ def execute_command(cmd_parts, env, timeout=None):
         CompletedProcess object with stdout, stderr, and returncode
     """
     try:
+        # Use a custom approach for Python commands to prevent warning-related issues
+        is_python_cmd = cmd_parts[0].endswith('python') or cmd_parts[0].endswith('python3')
+        
+        if is_python_cmd:
+            # Create a temporary file to capture stderr
+            stderr_file = None
+            
+            try:
+                # Redirect stderr to a file and then read it back after execution
+                import tempfile
+                stderr_file = tempfile.NamedTemporaryFile(delete=False, mode='w+')
+                stderr_path = stderr_file.name
+                stderr_file.close()
+                
+                # Run process with stderr redirected to file
+                process = subprocess.Popen(
+                    cmd_parts,
+                    stdout=subprocess.PIPE,
+                    stderr=open(stderr_path, 'w'),
+                    env=env,
+                    text=True
+                )
+                
+                # Wait for process to complete, with timeout
+                try:
+                    stdout, _ = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    return subprocess.CompletedProcess(
+                        args=cmd_parts,
+                        returncode=124,
+                        stdout="Command timed out after {} seconds".format(timeout),
+                        stderr="Process was killed due to timeout"
+                    )
+                
+                # Read stderr from file after process completes
+                with open(stderr_path, 'r') as f:
+                    stderr = f.read()
+                
+                # Create a CompletedProcess object manually
+                return subprocess.CompletedProcess(
+                    args=cmd_parts,
+                    returncode=process.returncode,
+                    stdout=stdout,
+                    stderr=stderr
+                )
+                
+            finally:
+                # Clean up temporary file
+                if stderr_file:
+                    import os
+                    try:
+                        os.unlink(stderr_path)
+                    except:
+                        pass
+        
+        # For non-Python commands, use the regular subprocess.run
         result = subprocess.run(
             cmd_parts, 
             capture_output=True, 
             text=True, 
             env=env,
-            shell=False,  # Never use shell=True to avoid shell-related issues
-            timeout=timeout  # Allow timeout for long-running processes
+            shell=False,
+            timeout=timeout
         )
         return result
+        
     except subprocess.TimeoutExpired as e:
         # Create a CompletedProcess-like object for timeout errors
         return subprocess.CompletedProcess(
             args=cmd_parts,
-            returncode=124,  # Use standard timeout exit code
+            returncode=124,
             stdout=f"Command timed out after {timeout} seconds",
             stderr=str(e)
         )
