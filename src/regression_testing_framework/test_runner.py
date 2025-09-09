@@ -1,11 +1,13 @@
 import os
 import subprocess
 import logging
-import shlex
 from datetime import datetime
 import shutil
 from pathlib import Path
-import re
+import signal
+import sys
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
 from .database import log_run
 from .config_parser import (
     load_config,
@@ -15,11 +17,23 @@ from .config_parser import (
     process_params,
     process_environment
 )
-import concurrent.futures
 
 # Base logs directory
 BASE_LOG_DIR = "test_runs"
 os.makedirs(BASE_LOG_DIR, exist_ok=True)
+
+# Default timeout for commands (in seconds)
+DEFAULT_TIMEOUT = 1800  # 30 minutes
+
+
+def setup_signal_handlers():
+    """Set up signal handlers to ensure clean exit."""
+    def signal_handler(sig, frame):
+        print(f"\nCaught signal {sig}. Exiting gracefully...")
+        sys.exit(1)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 def create_run_directory():
@@ -30,398 +44,316 @@ def create_run_directory():
     return run_dir
 
 
-def build_command(base_command, params):
+def execute_command(cmd, env, timeout=None):
     """
-    Build a command list for subprocess execution.
+    Execute a shell command and return the result.
     
     Args:
-        base_command: The base command string
-        params: List of parameters
-        
-    Returns:
-        List of command parts suitable for subprocess.run
-    """
-    if not base_command:
-        raise ValueError("Base command cannot be empty")
-    
-    cmd_parts = [base_command]
-    
-    # Add parameters if they exist
-    if params:
-        cmd_parts.extend(params)
-        
-    return cmd_parts
-
-
-def execute_command(cmd_parts, env, timeout=None):
-    """
-    Execute a command and return the result.
-    
-    Args:
-        cmd_parts: List of command parts
+        cmd: Command string to execute
         env: Environment dictionary
         timeout: Maximum time in seconds to wait for the command to complete
-                (None means wait indefinitely)
         
     Returns:
-        CompletedProcess object with stdout, stderr, and returncode
+        (stdout, stderr, returncode)
     """
+    print(f"Running command: {cmd}")
+    
     try:
-        # Use a custom approach for Python commands to prevent warning-related issues
-        is_python_cmd = cmd_parts[0].endswith('python') or cmd_parts[0].endswith('python3')
-        
-        if is_python_cmd:
-            # Create a temporary file to capture stderr
-            stderr_file = None
-            
-            try:
-                # Redirect stderr to a file and then read it back after execution
-                import tempfile
-                stderr_file = tempfile.NamedTemporaryFile(delete=False, mode='w+')
-                stderr_path = stderr_file.name
-                stderr_file.close()
-                
-                # Run process with stderr redirected to file
-                process = subprocess.Popen(
-                    cmd_parts,
-                    stdout=subprocess.PIPE,
-                    stderr=open(stderr_path, 'w'),
-                    env=env,
-                    text=True
-                )
-                
-                # Wait for process to complete, with timeout
-                try:
-                    stdout, _ = process.communicate(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    return subprocess.CompletedProcess(
-                        args=cmd_parts,
-                        returncode=124,
-                        stdout="Command timed out after {} seconds".format(timeout),
-                        stderr="Process was killed due to timeout"
-                    )
-                
-                # Read stderr from file after process completes
-                with open(stderr_path, 'r') as f:
-                    stderr = f.read()
-                
-                # Create a CompletedProcess object manually
-                return subprocess.CompletedProcess(
-                    args=cmd_parts,
-                    returncode=process.returncode,
-                    stdout=stdout,
-                    stderr=stderr
-                )
-                
-            finally:
-                # Clean up temporary file
-                if stderr_file:
-                    import os
-                    try:
-                        os.unlink(stderr_path)
-                    except:
-                        pass
-        
-        # For non-Python commands, use the regular subprocess.run
-        result = subprocess.run(
-            cmd_parts, 
-            capture_output=True, 
-            text=True, 
+        # Simple command execution using shell=True
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             env=env,
-            shell=False,
+            shell=True,
             timeout=timeout
         )
-        return result
+        return process.stdout, process.stderr, process.returncode
         
-    except subprocess.TimeoutExpired as e:
-        # Create a CompletedProcess-like object for timeout errors
-        return subprocess.CompletedProcess(
-            args=cmd_parts,
-            returncode=124,
-            stdout=f"Command timed out after {timeout} seconds",
-            stderr=str(e)
-        )
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out after {timeout} seconds: {cmd}")
+        return f"Command timed out after {timeout} seconds", "Timeout", 124
+    except Exception as e:
+        print(f"Error executing command: {e}")
+        return "", str(e), 1
 
 
-def create_log_file(run_dir, test_name, start_time, cmd_parts, env_vars, result):
-    """
-    Create a log file with test execution details.
-    """
-    success = result.returncode == 0
+def create_log_file(run_dir, test_name, start_time, cmd, env_vars, stdout, stderr, returncode):
+    """Create a log file with test execution details."""
+    success = returncode == 0
     status_str = "PASS" if success else "FAIL"
     start_time_formatted = start_time.strftime("%Y%m%d_%H%M%S")
     
-    # Create a descriptive log filename
     log_filename = f"{start_time_formatted}_{test_name}_{status_str}.log"
     log_file = os.path.join(run_dir, log_filename)
     
     with open(log_file, "w") as log:
         log.write(f"Test: {test_name}\n")
         log.write(f"Status: {'SUCCESS' if success else 'FAILURE'}\n")
+        log.write(f"Command: {cmd}\n")
         
-        # Write the actual command that was run
-        cmd_str = ' '.join(cmd_parts)
-        log.write(f"Command: {cmd_str}\n")
-        
-        # Include environment variables in the log
         if env_vars:
             log.write("Environment:\n")
             for key, value in env_vars.items():
                 log.write(f"  {key}={value}\n")
         
-        log.write(f"Return code: {result.returncode}\n")
+        log.write(f"Return code: {returncode}\n")
         log.write(f"Start time: {start_time}\n")
         log.write(f"End time: {datetime.utcnow()}\n\n")
         log.write(f"--- STDOUT ---\n")
-        log.write(result.stdout)
-        if result.stderr:
+        log.write(stdout)
+        if stderr:
             log.write("\n\n--- STDERR ---\n")
-            log.write(result.stderr)
+            log.write(stderr)
     
     return log_file
 
 
-def create_exception_log(run_dir, test_name, start_time, exception):
+def get_test_command(config, test_config):
     """
-    Create a log file for an exception during test execution.
-    """
-    start_time_formatted = start_time.strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{start_time_formatted}_{test_name}_EXCEPTION.log"
-    log_file = os.path.join(run_dir, log_filename)
+    Get the command string for a test, handling both direct command and base_command + params styles.
     
-    with open(log_file, "w") as log:
-        log.write(f"Test: {test_name}\n")
-        log.write(f"Status: EXCEPTION\n")
-        log.write(f"Start time: {start_time}\n")
-        log.write(f"End time: {datetime.utcnow()}\n\n")
-        log.write(f"--- ERROR ---\n")
-        log.write(str(exception))
-    
-    return log_file
-
-
-def process_test_result(result, success):
-    """
-    Process test result to extract error traces and failure information.
-    
-    A test is only considered failed if the return code is non-zero.
-    Warnings that appear in stderr but don't cause a non-zero exit code
-    will be logged but won't cause the test to be marked as failed.
-    """
-    if success:
-        # If the command exited with code 0, it's a success even if stderr has content
-        return None, None
-    
-    # If we get here, the command had a non-zero exit code (actual failure)
-    stdout, stderr, returncode = result.stdout, result.stderr, result.returncode
-    
-    error_message = f"Command failed with return code {returncode}"
-    
-    # Extract the most relevant error info from stderr if available
-    error_trace = stderr.split("\n")[-3:] if stderr else None
-    
-    if not error_trace:
-        error_trace = [error_message]
+    Args:
+        config: Global configuration dictionary
+        test_config: Test-specific configuration dictionary
         
-    failure = stderr if stderr else error_message
+    Returns:
+        Command string to execute
+    """
+    if "command" in test_config:
+        # Direct command format
+        cmd = test_config["command"]
+        
+        # Add parameters if they exist
+        if "params" in test_config and test_config["params"]:
+            params = " ".join(str(p) for p in test_config["params"])
+            cmd = f"{cmd} {params}"
+        return cmd
+    else:
+        # Legacy format with base_command and params
+        base_command = get_base_command(config, test_config)
+        params = process_params(test_config)
+        
+        # Build command
+        cmd_parts = [base_command]
+        if params:
+            cmd_parts.extend(params)
+        return ' '.join(cmd_parts)
+
+
+def get_test_timeout(config, test_config):
+    """
+    Get the timeout value for a test, handling defaults.
     
-    return error_trace, failure
+    Args:
+        config: Global configuration dictionary
+        test_config: Test-specific configuration dictionary
+        
+    Returns:
+        Timeout value in seconds
+    """
+    timeout = test_config.get('timeout', config.get('timeout', DEFAULT_TIMEOUT))
+    try:
+        return int(timeout)
+    except (ValueError, TypeError):
+        return DEFAULT_TIMEOUT
+
+
+def find_test_config(config, test_name):
+    """
+    Find the configuration for a test, handling both top-level and nested configurations.
+    
+    Args:
+        config: Configuration dictionary
+        test_name: Name of the test
+        
+    Returns:
+        Test configuration dictionary or None if not found
+    """
+    # First check top-level
+    test_config = get_test_config(config, test_name)
+    
+    # If not found, check under 'tests' key
+    if not test_config and "tests" in config and test_name in config["tests"]:
+        test_config = config["tests"][test_name]
+        
+    return test_config
+
+
+def get_all_test_names(config):
+    """
+    Get all test names from the configuration, handling both top-level and nested tests.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        List of test names
+    """
+    # Get top-level tests first
+    test_names = get_test_names(config)
+    
+    # If empty, check if tests are under 'tests' key
+    if len(test_names) == 0 and "tests" in config and isinstance(config["tests"], dict):
+        test_names = list(config["tests"].keys())
+        print(f"Found {len(test_names)} tests under 'tests' section")
+    
+    return test_names
 
 
 def run_single_test(config_path, test_name, run_dir):
     """
-    Run a single test from a configuration file.
+    Run a single test as a subprocess.
+    
+    Args:
+        config_path: Path to the configuration file
+        test_name: Name of the test to run
+        run_dir: Directory to store test results
+        
+    Returns:
+        Dictionary with test results
     """
     # Load configuration
-    config = load_config(config_path)
-    test_config = get_test_config(config, test_name)
-    
-    # Validate test configuration
-    if not test_config or not isinstance(test_config, dict):
-        return {
-            "config": test_name,
-            "success": False,
-            "error_trace": ["Test configuration not found or invalid"],
-            "log_file": None
-        }
-    
-    # Start timing
-    start_time = datetime.utcnow()
-    
     try:
-        # Get base command and parameters
-        base_command = get_base_command(config, test_config)
-        if not base_command:
-            raise ValueError(f"No base command specified for test: {test_name}")
+        config = load_config(config_path)
+        test_config = find_test_config(config, test_name)
         
-        params = process_params(test_config)
+        if not test_config:
+            return {
+                "config": test_name,
+                "success": False,
+                "error_trace": ["Test configuration not found"],
+                "log_file": None
+            }
         
-        # Setup environment variables
+        # Start timing
+        start_time = datetime.utcnow()
+        
+        # Get command, environment variables, and timeout
+        cmd = get_test_command(config, test_config)
         env = os.environ.copy()
         env_vars = process_environment(test_config)
         env.update(env_vars)
+        timeout = get_test_timeout(config, test_config)
         
-        # Get timeout from test config or use default
-        # A default of None means wait indefinitely
-        timeout = test_config.get('timeout', None)
-        if timeout is not None:
-            try:
-                timeout = int(timeout)
-            except (ValueError, TypeError):
-                # If timeout is not a valid integer, use None (wait indefinitely)
-                timeout = None
-        
-        # Build and execute command
-        cmd_parts = build_command(base_command, params)
-        result = execute_command(cmd_parts, env, timeout=timeout)
-        
-        # Special handling for timeout result
-        if result.returncode == 124 and "timed out" in result.stdout:
-            success = False
-            error_trace = [f"Command timed out after {timeout} seconds"]
-            failure = f"Timeout after {timeout} seconds"
-        else:
-            # Determine success/failure based on return code only
-            success = result.returncode == 0
-            error_trace, failure = process_test_result(result, success)
+        # Execute command
+        stdout, stderr, returncode = execute_command(cmd, env, timeout)
         
         # Create log file
-        log_file = create_log_file(run_dir, test_name, start_time, cmd_parts, env_vars, result)
+        log_file = create_log_file(run_dir, test_name, start_time, cmd, env_vars, stdout, stderr, returncode)
+        
+        # A test is successful if return code is 0, regardless of stderr content
+        success = returncode == 0
+        error_trace = None if success else [f"Command failed with return code {returncode}"]
+        
+        # Record to database
+        end_time = datetime.utcnow()
+        log_run(test_name, test_name, cmd, success, start_time, end_time, log_file, error_trace, None)
+        
+        print(f"Test '{test_name}' {'Succeeded' if success else 'Failed'}")
+        
+        return {
+            "config": test_name,
+            "success": success,
+            "error_trace": error_trace,
+            "log_file": log_file
+        }
         
     except Exception as e:
-        success = False
-        error_trace = str(e).split("\n")
-        failure = str(e)
-        log_file = create_exception_log(run_dir, test_name, start_time, e)
-    
-    # Record end time and log the run
-    end_time = datetime.utcnow()
-    
-    cmd_str = ' '.join(cmd_parts) if 'cmd_parts' in locals() else "Command generation failed"
-    log_run(test_name, test_name, cmd_str, success, start_time, end_time, log_file, error_trace, failure)
-    
-    # Return result information
-    result_info = {
-        "config": test_name, 
-        "success": success, 
-        "log_file": log_file, 
-        "error_trace": error_trace if not success else None
-    }
-    
-    return result_info
+        print(f"Error running test '{test_name}': {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "config": test_name,
+            "success": False,
+            "error_trace": [str(e)],
+            "log_file": None
+        }
 
 
-def run_tests(config_path, run_dir, max_workers=4):
+def run_tests(config_path, run_dir, max_workers=None):
     """
-    Run multiple tests in parallel using ThreadPoolExecutor.
+    Run multiple tests in parallel using ProcessPoolExecutor.
     
-    Ensures all tests complete before returning, with improved error handling 
-    and progress tracking for long-running tests.
+    Args:
+        config_path: Path to the configuration file
+        run_dir: Directory to store test results
+        max_workers: Number of worker processes to use
+        
+    Returns:
+        List of test results
     """
     config = load_config(config_path)
-    test_names = get_test_names(config)
+    test_names = get_all_test_names(config)
     
     if not test_names:
         print("No tests found in the configuration file.")
         return []
     
-    results = []
-    pending_count = len(test_names)
-    completed_count = 0
+    # Determine the number of worker processes
+    if max_workers is None:
+        from multiprocessing import cpu_count
+        max_workers = min(cpu_count(), len(test_names))
+    else:
+        max_workers = min(max_workers, len(test_names), os.cpu_count() or 1)
     
-    print(f"Starting {pending_count} tests with {max_workers} parallel workers")
+    print(f"Starting {len(test_names)} tests with {max_workers} parallel processes")
     
-    # Use ThreadPoolExecutor to run tests in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all test jobs to the thread pool
-        future_to_test = {
-            executor.submit(run_single_test, config_path, test_name, run_dir): test_name 
-            for test_name in test_names
-        }
-        
-        # Track which tests are still running
-        running_tests = set(test_names)
-        
-        try:
-            # Process results as they complete
-            for future in concurrent.futures.as_completed(future_to_test):
-                test_name = future_to_test[future]
-                running_tests.remove(test_name)
-                completed_count += 1
-                
-                try:
-                    result = future.result()
-                    results.append(result)
-                    status = "Succeeded" if result["success"] else "Failed"
-                    print(f"Test '{test_name}' {status} [{completed_count}/{pending_count} completed]")
-                    
-                    # Print remaining tests every 5 completions or when only a few remain
-                    if running_tests and (completed_count % 5 == 0 or len(running_tests) <= 3):
-                        print(f"Still running: {', '.join(running_tests)}")
-                        
-                except Exception as e:
-                    print(f"Error running test '{test_name}': {e}")
-                    results.append({
-                        "config": test_name,
-                        "success": False,
-                        "error_trace": [str(e)],
-                        "log_file": None
-                    })
-        except KeyboardInterrupt:
-            print("\nReceived keyboard interrupt. Cancelling pending tests...")
-            
-            # Attempt to cancel any pending futures
-            for future in future_to_test:
-                future.cancel()
-            
-            # Wait with a timeout to allow for cleanup
-            # This is a best-effort attempt to avoid process orphaning
-            executor.shutdown(wait=True, cancel_futures=True)
-            
-            # Include the interrupted tests in results
-            for test_name in running_tests:
-                results.append({
-                    "config": test_name,
-                    "success": False,
-                    "error_trace": ["Test was interrupted"],
-                    "log_file": None
-                })
-            
-            print(f"Interrupted with {len(running_tests)} tests still running")
-            
-        except Exception as e:
-            print(f"Unexpected error in test execution: {e}")
-            # Ensure we don't lose track of running tests in case of errors
-            for test_name in running_tests:
-                if not any(r["config"] == test_name for r in results):
-                    results.append({
-                        "config": test_name,
-                        "success": False,
-                        "error_trace": [f"Test execution error: {str(e)}"],
-                        "log_file": None
-                    })
-    
-    # Final verification that we have a result for every test
-    result_test_names = {r["config"] for r in results}
-    for test_name in test_names:
-        if test_name not in result_test_names:
-            print(f"Warning: No result recorded for test '{test_name}', marking as failed")
-            results.append({
-                "config": test_name,
-                "success": False,
-                "error_trace": ["Test result was not properly recorded"],
-                "log_file": None
-            })
+    # Run tests in parallel
+    results = run_tests_parallel(config_path, test_names, run_dir, max_workers)
     
     print(f"All {len(test_names)} tests completed execution")
     return results
 
 
+def run_tests_parallel(config_path, test_names, run_dir, max_workers):
+    """
+    Run tests in parallel using a process pool.
+    
+    Args:
+        config_path: Path to the configuration file
+        test_names: List of test names to run
+        run_dir: Directory to store test results
+        max_workers: Number of worker processes to use
+        
+    Returns:
+        List of test results
+    """
+    results = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks to the executor
+        future_to_test = {
+            executor.submit(run_single_test, config_path, test_name, run_dir): test_name
+            for test_name in test_names
+        }
+        
+        # Collect results as they complete
+        completed = 0
+        total_tests = len(test_names)
+        for future in concurrent.futures.as_completed(future_to_test):
+            test_name = future_to_test[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                print(f"Test '{test_name}' raised an exception: {e}")
+                results.append({
+                    "config": test_name,
+                    "success": False,
+                    "error_trace": [f"Exception: {str(e)}"],
+                    "log_file": None
+                })
+            
+            # Simple progress output
+            completed += 1
+            print(f"Progress: {completed}/{total_tests} tests completed")
+    
+    return results
+
+
 def calculate_summary(results):
-    """
-    Calculate test summary statistics.
-    """
+    """Calculate test summary statistics."""
     successful = sum(1 for r in results if r["success"])
     total = len(results)
     success_percent = (successful / total) * 100 if total > 0 else 0
@@ -431,9 +363,7 @@ def calculate_summary(results):
 
 
 def print_summary(successful, total, success_percent, failing_tests):
-    """
-    Print test summary to console.
-    """
+    """Print test summary to console."""
     print("\n=== TEST SUMMARY ===")
     print(f"Tests passed: {successful}/{total} ({success_percent:.1f}%)")
     
@@ -442,28 +372,12 @@ def print_summary(successful, total, success_percent, failing_tests):
         for test in failing_tests:
             print(f"- {test['config']}")
             if test.get("error_trace"):
-                error = test["error_trace"] if isinstance(test["error_trace"], list) else [test["error_trace"]]
-                for line in error:
-                    if line:
-                        print(f"  {line}")
-
-
-def determine_output_path(output_path, run_dir):
-    """
-    Determine the final output path for the test report.
-    """
-    if not output_path:
-        output_path = os.path.join(run_dir, "test_report.txt")
-    elif os.path.dirname(output_path) == '':
-        output_path = os.path.join(run_dir, output_path)
-    
-    return output_path
+                for line in test["error_trace"]:
+                    print(f"  {line}")
 
 
 def write_report(output_path, successful, total, success_percent, results):
-    """
-    Write test report to file.
-    """
+    """Write test report to file."""
     with open(output_path, "w") as f:
         f.write(f"Test Summary\n")
         f.write(f"============\n")
@@ -474,26 +388,20 @@ def write_report(output_path, successful, total, success_percent, results):
             status = "PASS" if result["success"] else "FAIL"
             f.write(f"{result['config']}: {status}\n")
             if not result["success"] and result.get("error_trace"):
-                error = result["error_trace"] if isinstance(result["error_trace"], list) else [result["error_trace"]]
-                for line in error:
-                    if line:
-                        f.write(f"  Error: {line}\n")
+                for line in result["error_trace"]:
+                    f.write(f"  Error: {line}\n")
         
         f.write("\nLog Files:\n")
         for result in results:
             if result.get("log_file"):
-                # Get the base filename only
                 log_filename = os.path.basename(result["log_file"])
                 f.write(f"{result['config']}: {log_filename}\n")
 
 
 def create_latest_symlink(run_dir):
-    """
-    Create or update the 'latest' symlink to point to the most recent test run.
-    """
+    """Create or update the 'latest' symlink to point to the most recent test run."""
     latest_link = os.path.join(BASE_LOG_DIR, "latest")
     
-    # Remove existing link/directory
     if os.path.exists(latest_link):
         if os.path.islink(latest_link):
             os.unlink(latest_link)
@@ -501,10 +409,8 @@ def create_latest_symlink(run_dir):
             shutil.rmtree(latest_link)
     
     try:
-        # Create relative symlink on UNIX systems
         os.symlink(os.path.basename(run_dir), latest_link)
     except (OSError, AttributeError):
-        # On Windows or if symlinks aren't supported, create a directory with copies
         os.makedirs(latest_link, exist_ok=True)
         for file in os.listdir(run_dir):
             src = os.path.join(run_dir, file)
@@ -513,32 +419,61 @@ def create_latest_symlink(run_dir):
                 shutil.copy2(src, dst)
 
 
-def run_test_from_cli(config_path, output_path=None, max_workers=4):
+def run_test_from_cli(config_path, output_path=None, max_workers=None):
     """
-    Run tests from CLI using thread pool for parallelism.
+    Run tests from CLI using ProcessPoolExecutor.
+    
+    Args:
+        config_path: Path to the configuration file
+        output_path: Path to write the output report
+        max_workers: Number of worker processes
+        
+    Returns:
+        Tuple of (results, run_dir)
     """
-    # Create a unique directory for this test run
+    setup_signal_handlers()
+    
     run_dir = create_run_directory()
     print(f"Launching tests from {config_path}")
     print(f"Test run directory: {run_dir}")
     
-    # Copy the config file to the run directory for reference
+    # Copy the config file to the run directory (outside try/except to ensure it happens)
     config_filename = os.path.basename(config_path)
-    shutil.copy2(config_path, os.path.join(run_dir, config_filename))
+    try:
+        shutil.copy2(config_path, os.path.join(run_dir, config_filename))
+        print(f"Config file copied to {run_dir}/{config_filename}")
+    except Exception as e:
+        print(f"Warning: Failed to copy config file: {e}")
     
-    # Run the tests
-    results = run_tests(config_path, run_dir, max_workers=max_workers)
+    results = []
+    try:
+        # Run the tests
+        results = run_tests(config_path, run_dir, max_workers=max_workers)
+    except Exception as e:
+        print(f"Error during test execution: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Calculate and print summary
-    successful, total, success_percent, failing_tests = calculate_summary(results)
-    print_summary(successful, total, success_percent, failing_tests)
-    
-    # Determine output path and write report
-    final_output_path = determine_output_path(output_path, run_dir)
-    write_report(final_output_path, successful, total, success_percent, results)
-    print(f"Report written to {final_output_path}")
-    
-    # Create a symlink to the latest run for convenience
-    create_latest_symlink(run_dir)
+    # Always try to generate the report, even if tests had errors
+    try:
+        # Calculate and print summary
+        successful, total, success_percent, failing_tests = calculate_summary(results)
+        print_summary(successful, total, success_percent, failing_tests)
+        
+        # Determine output path and write report
+        if not output_path:
+            output_path = os.path.join(run_dir, "test_report.txt")
+        elif os.path.dirname(output_path) == '':
+            output_path = os.path.join(run_dir, output_path)
+        
+        write_report(output_path, successful, total, success_percent, results)
+        print(f"Report written to {output_path}")
+        
+        # Create a symlink to the latest run
+        create_latest_symlink(run_dir)
+    except Exception as e:
+        print(f"Error generating report: {e}")
+        import traceback
+        traceback.print_exc()
     
     return results, run_dir

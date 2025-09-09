@@ -47,8 +47,17 @@ def build_command(base_command, params):
 
 def execute_command(cmd_to_run, env):
     """
-    Execute a command with shell=True and return the result.
+    Execute a command and return the result.
+    
+    Args:
+        cmd_to_run: Command string to run
+        env: Environment dictionary
+        
+    Returns:
+        CompletedProcess object with stdout, stderr, and returncode
     """
+    # The success/failure determination is based solely on the exit code
+    # Stderr output will not cause a test to fail
     return subprocess.run(
         cmd_to_run,
         shell=True,
@@ -169,14 +178,17 @@ def run_single_test(config_path, test_name, run_dir):
         
         result = execute_command(cmd_to_run, env)
         
-        # Determine success/failure
+        # Determine success/failure based ONLY on return code, never on stderr content
         success = result.returncode == 0
         
         # Create log file
         log_file = create_log_file(run_dir, test_name, start_time, cmd_to_run, env_vars, result)
         
-        # Process results
-        error_trace, failure = process_test_result(result, success)
+        # Process error information only if the test actually failed (non-zero exit code)
+        if not success:
+            error_trace, failure = process_test_result(result, success)
+        else:
+            error_trace, failure = None, None
         
     except Exception as e:
         success = False

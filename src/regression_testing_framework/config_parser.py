@@ -50,9 +50,11 @@ def get_test_names(config: Dict[str, Any]) -> List[str]:
         config: The parsed configuration dictionary
         
     Returns:
-        List of test names (excluding 'base_command')
+        List of test names (excluding 'base_command' and 'tests')
     """
-    return [name for name in config.keys() if name != 'base_command']
+    # Exclude special keys that are not tests
+    excluded_keys = ['base_command', 'tests']
+    return [name for name in config.keys() if name not in excluded_keys]
 
 def process_params(test_config: Dict[str, Any]) -> List[str]:
     """
