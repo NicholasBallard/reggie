@@ -1,6 +1,6 @@
 [project]
 name = "regression-testing-framework"
-version = "0.1.11"
+version = "0.2.0"
 description = "Run parallel test configurations with log discovery and summary."
 readme = "README.md"
 authors = [
